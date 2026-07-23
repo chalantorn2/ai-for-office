@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Secrets — DB credentials, JWT signing key, Anthropic API key.
+# The main repo hardcoded these in api/config.php; do not repeat that here.
+api/config.local.php
+deploy.secret.ps1
+.env
+.env.*
+!.env.example
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
