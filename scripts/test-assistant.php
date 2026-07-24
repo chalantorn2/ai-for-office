@@ -76,7 +76,7 @@ echo str_repeat('-', 72) . "\n";
 $started = microtime(true);
 $firstByte = null;
 $buffer = '';
-$events = ['tool' => [], 'meta' => null, 'done' => null, 'error' => null];
+$events = ['tool' => [], 'write' => [], 'meta' => null, 'done' => null, 'error' => null];
 
 $ch = curl_init('http://127.0.0.1:8000/api/assistant.php');
 curl_setopt_array($ch, [
@@ -113,6 +113,17 @@ curl_setopt_array($ch, [
             switch ($event) {
                 case 'text':  echo $payload['delta']; break;
                 case 'tool':  $events['tool'][] = $payload['name']; echo "\n  [tool: {$payload['name']}]\n"; break;
+                // A change waiting on a button press. Printed in full: the whole
+                // point of the card is that a person reads it before agreeing,
+                // and this is the only place to see what they would be shown.
+                case 'write':
+                    $card = $payload['card'];
+                    $events['write'][] = $card;
+                    echo "\n  [proposed #{$card['id']} · {$card['action']} {$card['entity']} · {$card['record_name']}]\n";
+                    foreach ($card['changes'] as $change) {
+                        echo "    {$change['label']}: " . ($change['from'] ?? '(ใหม่)') . " → {$change['to']}\n";
+                    }
+                    break;
                 case 'meta':  $events['meta'] = $payload; break;
                 case 'done':  $events['done'] = $payload; break;
                 case 'error': $events['error'] = $payload; echo "\n  [ERROR: {$payload['message']}]\n"; break;

@@ -18,6 +18,16 @@ const NOVA_OFFICE_LABELS = [
 ];
 
 /**
+ * Logins that are not a colleague.
+ *
+ * `dev_lay` is เลย์'s test account, named เทส so that a test session is visibly a
+ * test session. It is a real row in `users` and signs in like any other — it is
+ * excluded from the roster only, so Nova never introduces a second person who
+ * does not exist.
+ */
+const NOVA_NON_STAFF_ACCOUNTS = ['dev_lay'];
+
+/**
  * How to address someone.
  *
  * Nickname plus the office they work for — "เลย์ · Seven Smile". For the few
@@ -107,9 +117,9 @@ function require_user(): array
  * is deliberately not given is anyone else's `about`: that text is written to
  * shape how Nova answers *that* person, and it is not everyone's to read.
  *
- * Two accounts belong to the same person and one is shared, so the list is of
- * logins rather than of humans. Both are described in profiles.json, which is
- * where the disambiguation belongs.
+ * `users` holds logins, not people: a test account sits alongside the staff, and
+ * listing it turns เลย์ into two colleagues. NOVA_NON_STAFF_ACCOUNTS is dropped
+ * here.
  */
 function nova_office_roster(PDO $pdo, int $excludeUserId): array
 {
@@ -120,8 +130,10 @@ function nova_office_roster(PDO $pdo, int $excludeUserId): array
     $stmt->execute([$excludeUserId]);
 
     $lines = [];
-    $seen = [];
     foreach ($stmt->fetchAll() as $row) {
+        if (in_array($row['username'], NOVA_NON_STAFF_ACCOUNTS, true)) {
+            continue;
+        }
         $d = nova_user_display($row);
         // An account with no nickname falls back to its login, which tells Nova
         // nothing about a person and should not be presented as a colleague.
@@ -131,11 +143,6 @@ function nova_office_roster(PDO $pdo, int $excludeUserId): array
         $office = $d['office'] === 'both'
             ? 'ทั้งสองออฟฟิศ'
             : ($d['office_label'] ?: '');
-        // One person, two logins: list them once.
-        if (isset($seen[$d['name']])) {
-            continue;
-        }
-        $seen[$d['name']] = true;
         $parts = array_filter([$office, $d['position']]);
         $lines[] = '- ' . $d['name'] . ($parts ? ' — ' . implode(' · ', $parts) : '');
     }

@@ -40,10 +40,19 @@ $FORBIDDEN = '/\b(DROP|DELETE|TRUNCATE|UPDATE|INSERT|REPLACE|RENAME|GRANT|REVOKE
 // clauses, not write statements. Strip them before scanning for real write verbs.
 $REFERENTIAL = '/\bON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|RESTRICT|SET\s+NULL|NO\s+ACTION|SET\s+DEFAULT|CURRENT_TIMESTAMP(?:\(\))?)/i';
 
+// A quoted string is data, not a verb. `ENUM('create','update')` is a column
+// definition and was being rejected as an UPDATE statement. Masking literals is
+// safe here because it only feeds the verb scan: the checks that decide what
+// actually runs — the statement must begin with CREATE TABLE IF NOT EXISTS /
+// CREATE INDEX / ALTER TABLE, and name a table prefixed `ai_` — read the
+// statement as written, so nothing can be smuggled in inside quotes.
+$LITERALS = "/'(?:[^'\\\\]|\\\\.|'')*'/";
+
 foreach ($statements as $i => $stmt) {
     $n = $i + 1;
 
-    if (preg_match($FORBIDDEN, preg_replace($REFERENTIAL, '', $stmt), $m)) {
+    $scannable = preg_replace([$LITERALS, $REFERENTIAL], '', $stmt);
+    if (preg_match($FORBIDDEN, $scannable, $m)) {
         fwrite(STDERR, "REJECTED statement $n: contains {$m[1]}\n");
         exit(3);
     }

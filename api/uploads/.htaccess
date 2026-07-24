@@ -1,0 +1,33 @@
+# Uploads are private. A rate sheet someone screenshotted is as sensitive as the
+# conversation it was attached to, so the files are never served from here —
+# api/image.php checks the JWT and the conversation's owner before streaming one.
+#
+# Both syntaxes are present because the shared host's Apache version is not ours
+# to pin: 2.4 reads Require, 2.2 reads Order/Deny, and each ignores the other.
+
+<IfModule mod_authz_core.c>
+  Require all denied
+</IfModule>
+
+<IfModule !mod_authz_core.c>
+  Order allow,deny
+  Deny from all
+</IfModule>
+
+# Belt and braces: even if the rules above are overridden, nothing in this tree
+# should ever be handed to an interpreter.
+#
+# php_flag exists only when PHP runs as an Apache module. Production runs PHP-FPM,
+# where it is an unknown directive and Apache answers the whole directory with a
+# 500 — which denies access, but by breaking rather than by rule, and hides
+# whether the Require above works at all. Guarded, so hosts without mod_php fall
+# through to a plain 403.
+<IfModule mod_php.c>
+  php_flag engine off
+</IfModule>
+<IfModule mod_php7.c>
+  php_flag engine off
+</IfModule>
+<IfModule mod_php5.c>
+  php_flag engine off
+</IfModule>

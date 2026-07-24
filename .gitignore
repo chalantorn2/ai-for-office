@@ -20,6 +20,12 @@ deploy.secret.ps1
 .env.*
 !.env.example
 
+# Images staff attached to a question. Private customer-facing material, and it
+# belongs to the deployment rather than the source — the .htaccess that closes
+# the directory to the web is tracked, nothing under it is.
+api/uploads/*
+!api/uploads/.htaccess
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

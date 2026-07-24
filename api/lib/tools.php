@@ -19,12 +19,15 @@
  *    37 suppliers") that were correct on the day they were typed and checked by
  *    nothing afterwards. Live counts come from nova_data_stats().
  *
- * Every query here is read-only and fully parameterised.
+ * Every query in this file is read-only and fully parameterised. The two tools
+ * that change ContactRate live in writes.php, and neither of them writes when it
+ * is called — see the note there.
  */
 
 declare(strict_types=1);
 
 require_once __DIR__ . '/stats.php';
+require_once __DIR__ . '/writes.php';
 
 const NOVA_MAX_ROWS = 40;
 
@@ -35,7 +38,18 @@ const NOVA_MAX_ROWS = 40;
  */
 const NOVA_APP_URL = 'https://contactrate.sevensmiletourandticket.com';
 
+/**
+ * The read-only tour page. This used to point at /edit/ because a detail page
+ * did not exist yet; it does now, and sending someone who only wanted a price
+ * into an edit form is how a record gets changed by accident.
+ */
 function nova_tour_link(int $id): string
+{
+    return NOVA_APP_URL . '/tours/' . $id;
+}
+
+/** The edit form. Only handed out when the user has said they want to change something. */
+function nova_tour_edit_link(int $id): string
 {
     return NOVA_APP_URL . '/edit/' . $id;
 }
@@ -127,8 +141,9 @@ function nova_tool_definitions(): array
                 'ค้นหาทัวร์ในระบบ ContactRate. เรียกใช้เมื่อผู้ใช้ถามถึงทัวร์ ' .
                 'ราคาทัวร์ โปรแกรมทัวร์ หรือทัวร์ในจังหวัดใดจังหวัดหนึ่ง. ' .
                 'Search tours. Call this whenever the user asks about tours, tour prices, ' .
-                'or what tours exist in a province. Returns id, name, destination, ' .
-                'type, adult/child price, and validity dates.',
+                'what tours exist in a province, or which tours a supplier provides ' .
+                '(look the supplier up first, then filter by supplier_id). Returns id, ' .
+                'name, destination, type, adult/child price, and validity dates.',
             'input_schema' => [
                 'type' => 'object',
                 'properties' => [
@@ -141,12 +156,25 @@ function nova_tool_definitions(): array
                     'query' => [
                         'type' => 'string',
                         'description' =>
-                            'Free-text match against the tour name, e.g. "phi phi", ' .
-                            '"เกาะพีพี", "james bond". Omit to list all in the destination.',
+                            'Free-text LIKE match against the tour name — nothing else. '
+                            . 'Tour names are almost all in English, so a Thai keyword '
+                            . 'matches almost nothing: search "4 Island", not "4 เกาะ"; '
+                            . '"Phi Phi", not "เกาะพีพี". Translate the user\'s Thai to the '
+                            . 'English wording used in tour names before calling. One word '
+                            . 'or two, not a phrase. If the result looks thin for a common '
+                            . 'tour, search again with another wording before reporting a '
+                            . 'count. Omit to list all in the destination.',
                     ],
                     'tour_type' => [
                         'type' => 'string',
                         'description' => 'Tour type filter, e.g. "Join", "Private".',
+                    ],
+                    'supplier_id' => [
+                        'type' => 'integer',
+                        'description' =>
+                            'Only tours from this supplier. Id from search_suppliers. '
+                            . 'This is how to answer "what tours does X provide" — the tour '
+                            . 'count on a supplier says how many there are but not which.',
                     ],
                     'max_adult_price' => [
                         'type' => 'number',
@@ -300,6 +328,10 @@ function nova_tool_definitions(): array
                 'required' => ['supplier_id'],
             ],
         ],
+
+        // Adding and editing records. Last in the list, and named `propose_` for
+        // the same reason: none of them writes anything on its own.
+        ...nova_write_tool_definitions(),
     ];
 }
 
@@ -310,19 +342,29 @@ function nova_tool_definitions(): array
  * Only client tools arrive here. Web search is a server tool: the model emits a
  * `server_tool_use` block, not `tool_use`, and Anthropic has already run it by
  * the time the response reaches us — so there is nothing to dispatch.
+ *
+ * `$ctx` is who is asking and which chat they are in. The read tools have no use
+ * for it; the two write tools cannot work without it, because a proposal that
+ * does not record who made it is not one anybody should be able to confirm.
+ *
+ * @param array{user_id:int, username:string, conversation_id:int} $ctx
  */
-function nova_run_tool(PDO $pdo, string $name, array $input): array
+function nova_run_tool(PDO $pdo, string $name, array $input, array $ctx = []): array
 {
     try {
         return match ($name) {
-            'search_tours'       => nova_search_tours($pdo, $input),
-            'get_tour_details'   => nova_tour_details($pdo, $input),
-            'search_hotels'      => nova_search_hotels($pdo, $input),
-            'get_hotel_rates'    => nova_hotel_rates($pdo, $input),
-            'get_hotel_details'  => nova_hotel_details($pdo, $input),
-            'search_suppliers'   => nova_search_suppliers($pdo, $input),
-            'get_supplier_files' => nova_supplier_files($pdo, $input),
-            default              => ['error' => "unknown tool: $name"],
+            'search_tours'         => nova_search_tours($pdo, $input),
+            'get_tour_details'     => nova_tour_details($pdo, $input),
+            'search_hotels'        => nova_search_hotels($pdo, $input),
+            'get_hotel_rates'      => nova_hotel_rates($pdo, $input),
+            'get_hotel_details'    => nova_hotel_details($pdo, $input),
+            'search_suppliers'     => nova_search_suppliers($pdo, $input),
+            'get_supplier_files'   => nova_supplier_files($pdo, $input),
+            'propose_tour_create'     => nova_propose_write($pdo, $ctx, 'tour', 'create', $input),
+            'propose_tour_update'     => nova_propose_write($pdo, $ctx, 'tour', 'update', $input),
+            'propose_supplier_create' => nova_propose_write($pdo, $ctx, 'supplier', 'create', $input),
+            'propose_supplier_update' => nova_propose_write($pdo, $ctx, 'supplier', 'update', $input),
+            default                   => ['error' => "unknown tool: $name"],
         };
     } catch (Throwable $e) {
         error_log("nova: tool $name failed: " . $e->getMessage());
@@ -346,6 +388,10 @@ function nova_search_tours(PDO $pdo, array $in): array
     if (!empty($in['tour_type'])) {
         $where[] = 't.tour_type LIKE ?';
         $args[] = '%' . $in['tour_type'] . '%';
+    }
+    if (!empty($in['supplier_id'])) {
+        $where[] = 't.supplier_id = ?';
+        $args[] = (int)$in['supplier_id'];
     }
     if (isset($in['max_adult_price'])) {
         $where[] = 't.adult_price <= ?';
@@ -396,16 +442,38 @@ function nova_search_tours(PDO $pdo, array $in): array
         array_pop($rows);
     }
 
+    // A Thai keyword searched against an English catalogue. Warned about at the
+    // point of use rather than only in the prompt, because this is where the
+    // wrong count is about to be handed over — and a count is the one thing the
+    // model repeats verbatim without questioning it. Measured every time: the
+    // day someone bulk-renames the tours into Thai, this stops firing on its own.
+    $thaiQuery = !empty($in['query'])
+        && preg_match('/[\x{0E00}-\x{0E7F}]/u', (string)$in['query']) === 1;
+
+    $warning = null;
+    if ($thaiQuery) {
+        $stats = nova_data_stats($pdo);
+        $warning = sprintf(
+            'คุณค้นด้วยคำไทย ("%s") แต่ชื่อทัวร์ในระบบเป็นภาษาอังกฤษ %d จาก %d รายการ '
+                . 'ผลที่ได้จึงไม่ใช่จำนวนจริง — ห้ามบอกจำนวนนี้กับผู้ใช้ '
+                . 'ให้ค้นซ้ำด้วยคำอังกฤษที่ตรงกัน แล้วค่อยตอบจากผลรวม',
+            $in['query'],
+            $stats['tours']['total'] - ($stats['tours']['thai_named'] ?? 0),
+            $stats['tours']['total']
+        );
+    }
+
     if (!$rows) {
         $stats = nova_data_stats($pdo);
         $known = implode(', ', array_keys($stats['tours']['destinations']));
 
-        return [
-            'tours' => [],
-            'note'  => 'No tours match these filters. This means the filters returned nothing — '
-                     . 'not that the data is missing. Say so plainly; do not invent tours. '
-                     . "Tours exist for these destinations: $known.",
-        ];
+        return array_filter([
+            'tours'   => [],
+            'warning' => $warning,
+            'note'    => 'No tours match these filters. This means the filters returned nothing — '
+                       . 'not that the data is missing. Say so plainly; do not invent tours. '
+                       . "Tours exist for these destinations: $known.",
+        ], fn($v) => $v !== null);
     }
 
     foreach ($rows as &$row) {
@@ -416,6 +484,7 @@ function nova_search_tours(PDO $pdo, array $in): array
     return array_filter([
         'count'     => count($rows),
         'truncated' => $truncated ?: null,
+        'warning'   => $warning,
         'tours'     => $rows,
     ], fn($v) => $v !== null);
 }
@@ -439,6 +508,9 @@ function nova_tour_details(PDO $pdo, array $in): array
 
     unset($tour['created_at'], $tour['updated_at'], $tour['updated_by']);
     $tour['link'] = nova_tour_link((int)$tour['id']);
+    // Carried on the detail result only — search returns up to 40 rows and none
+    // of them are being edited. The model is told when it may pass this on.
+    $tour['edit_link'] = nova_tour_edit_link((int)$tour['id']);
 
     // Brochures are the part staff actually ask for; the gallery is decoration
     // and would only cost tokens. Counted here rather than listed, with the

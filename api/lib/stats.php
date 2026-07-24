@@ -31,11 +31,11 @@ function nova_data_stats(PDO $pdo): array
     // without changing it would serve a stale cache that is missing the new
     // keys — a deploy-time bug that only shows up an hour later, once the old
     // entry expires and hides the evidence. Bump it whenever the shape changes.
-    $cache = sys_get_temp_dir() . '/nova-stats-v2.json';
+    $cache = sys_get_temp_dir() . '/nova-stats-v3.json';
 
     if (is_file($cache) && time() - filemtime($cache) < NOVA_STATS_TTL) {
         $cached = json_decode((string)file_get_contents($cache), true);
-        if (is_array($cached) && isset($cached['tours'], $cached['hotels']['areas'])) {
+        if (is_array($cached) && isset($cached['tours']['thai_named'], $cached['hotels']['areas'])) {
             return $cached;
         }
     }
@@ -52,12 +52,22 @@ function nova_data_stats(PDO $pdo): array
 
 function nova_read_stats(PDO $pdo): array
 {
-    $tours = ['total' => 0, 'destinations' => [], 'no_destination' => 0];
+    $tours = ['total' => 0, 'destinations' => [], 'no_destination' => 0, 'thai_named' => 0];
     $rows = $pdo->query(
         "SELECT destination, COUNT(*) AS c
            FROM tours
           GROUP BY destination"
     )->fetchAll();
+
+    // How many tours are actually named in Thai — measured, because the answer
+    // decides how a Thai question has to be searched and it is not what anyone
+    // guesses. `search_tours` matches `query` against `tour_name` with a plain
+    // LIKE, so asking "ทัวร์ 4 เกาะ" and searching the Thai words reaches only
+    // the handful of Thai-named rows and misses every "4 Island Speed Boat" in
+    // the catalogue. Nothing errors: the answer is a confident, wrong count.
+    $tours['thai_named'] = (int)$pdo->query(
+        "SELECT COUNT(*) FROM tours WHERE tour_name REGEXP '[ก-๙]'"
+    )->fetchColumn();
 
     foreach ($rows as $row) {
         $name = trim((string)($row['destination'] ?? ''));
@@ -154,12 +164,31 @@ function nova_stats_prompt(array $stats): string
     $withRates = $stats['hotels']['with_rates'];
     $noRates = $hotelTotal - $withRates;
 
+    $tourTotal = $stats['tours']['total'];
+    $thaiNamed = $stats['tours']['thai_named'] ?? 0;
+
     $lines = [
-        '- ทัวร์ทั้งหมด ' . $stats['tours']['total'] . ' รายการ แยกตามจังหวัด: '
+        '- ทัวร์ทั้งหมด ' . $tourTotal . ' รายการ แยกตามจังหวัด: '
             . implode(' · ', $tourDests),
         '- โรงแรมทั้งหมด ' . $hotelTotal . ' แห่ง อยู่ในจังหวัด: '
             . implode(' · ', $hotelProvinces),
     ];
+
+    // The single most common way to get a confidently wrong answer out of this
+    // system. The catalogue is named in English; questions arrive in Thai. A
+    // Thai keyword search reaches only the handful of Thai-named rows and
+    // reports the rest as not existing.
+    $lines[] = sprintf(
+        '- **ชื่อทัวร์ในระบบเป็นภาษาอังกฤษเกือบทั้งหมด** — มีชื่อไทยแค่ %d จาก %d รายการ '
+            . 'เวลาค้นทัวร์ด้วยคำไทย ให้แปลเป็นคำอังกฤษที่ใช้จริงในชื่อทัวร์ก่อนเสมอ '
+            . '("สี่เกาะ"/"4 เกาะ" → "4 Island", "เจ็ดเกาะ" → "7 Island", '
+            . '"เรือเร็ว" → "Speed Boat", "เรือหางยาว" → "Longtail", '
+            . '"ดำน้ำ" → "Snorkeling" หรือ "Diving", "เกาะพีพี" → "Phi Phi") '
+            . 'ถ้าค้นคำไทยแล้วเจอน้อยหรือไม่เจอ ห้ามสรุปว่าไม่มี — ค้นซ้ำด้วยคำอังกฤษก่อน '
+            . 'และถ้าคำหนึ่งเจอไม่ครบ ให้ค้นหลายคำ',
+        $thaiNamed,
+        $tourTotal
+    );
 
     if ($stats['hotels']['areas']) {
         $lines[] = '- ย่านที่โรงแรมตั้งอยู่ (ตามที่บันทึกไว้): '

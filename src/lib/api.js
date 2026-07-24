@@ -16,7 +16,56 @@ export function getToken() {
 
 export function setToken(token) {
   if (token) localStorage.setItem(TOKEN_KEY, token)
-  else localStorage.removeItem(TOKEN_KEY)
+  else {
+    localStorage.removeItem(TOKEN_KEY)
+    // Object URLs outlive the session that was allowed to fetch them. Dropping
+    // them on the way out means the next person to sign in on this machine
+    // cannot see the last one's screenshots still on screen.
+    forgetImages()
+  }
+}
+
+/**
+ * Attached images, keyed by ai_message_images id.
+ *
+ * `<img src>` cannot carry an Authorization header and the uploads directory is
+ * closed to direct requests, so each image is fetched with the token and shown
+ * as a blob. One promise per id is cached: a thread can mention the same image
+ * in several renders, and a fetch per render would re-download it every time.
+ *
+ * @type {Map<number, Promise<string>>}
+ */
+const imageUrls = new Map()
+
+/** Resolves to an object URL for one attachment. */
+export function loadImage(id) {
+  let url = imageUrls.get(id)
+  if (url) return url
+
+  url = (async () => {
+    const res = await fetch(`${BASE}/image.php?id=${id}`, {
+      headers: authHeaders(getToken()),
+    })
+    if (!res.ok) {
+      // Not cached as a rejection the caller keeps hitting — dropping it lets a
+      // remount try again, which is the right behaviour for a blip.
+      imageUrls.delete(id)
+      if (res.status === 401) setToken(null)
+      throw new ApiError(res.status, 'image_failed')
+    }
+    return URL.createObjectURL(await res.blob())
+  })()
+
+  imageUrls.set(id, url)
+  return url
+}
+
+/** Releases every cached image. */
+function forgetImages() {
+  for (const pending of imageUrls.values()) {
+    pending.then(URL.revokeObjectURL, () => {})
+  }
+  imageUrls.clear()
 }
 
 /**
@@ -92,14 +141,53 @@ export const api = {
 
   getConversation: (id) => request(`conversations.php?id=${id}`),
 
-  createConversation: (title) =>
-    request('conversations.php', { method: 'POST', body: { title } }),
+  createConversation: (title, projectId = null) =>
+    request('conversations.php', {
+      method: 'POST',
+      body: { title, project_id: projectId },
+    }),
 
   renameConversation: (id, title) =>
     request(`conversations.php?id=${id}`, { method: 'PATCH', body: { title } }),
 
+  /** Files a chat into a project, or out of one with `null`. */
+  moveConversation: (id, projectId) =>
+    request(`conversations.php?id=${id}`, {
+      method: 'PATCH',
+      body: { project_id: projectId },
+    }),
+
   deleteConversation: (id) =>
     request(`conversations.php?id=${id}`, { method: 'DELETE' }),
+
+  listProjects: () => request('projects.php'),
+
+  createProject: (name) =>
+    request('projects.php', { method: 'POST', body: { name } }),
+
+  renameProject: (id, name) =>
+    request(`projects.php?id=${id}`, { method: 'PATCH', body: { name } }),
+
+  /** Deletes the folder only — the chats inside are released, not removed. */
+  deleteProject: (id) => request(`projects.php?id=${id}`, { method: 'DELETE' }),
+
+  /**
+   * Tour changes Nova proposed in one chat, in whatever state they ended up.
+   * Only needed on reload — during a turn the cards arrive on the stream.
+   */
+  listWrites: (conversationId) =>
+    request(`writes.php?conversation_id=${conversationId}`),
+
+  /**
+   * Applies a proposed change to ContactRate, or turns it down.
+   *
+   * The only call in the app that writes to the main system's tables, and it
+   * only ever runs from a button. `confirm` is sent explicitly rather than
+   * implied by the endpoint, so neither outcome can be reached by a request
+   * that lost a field on the way.
+   */
+  decideWrite: (writeId, confirm) =>
+    request('writes.php', { method: 'POST', body: { write_id: writeId, confirm } }),
 
   /**
    * Spend for the current calendar month. `scope: 'all'` adds the office total
@@ -117,10 +205,17 @@ export const api = {
    * message and everything after it is deleted server-side before the new
    * question is stored, which is how editing an earlier question works.
    *
-   * @param {object} handlers - { onMeta, onTool, onText, onDone, onError }
+   * `projectId` only applies to the first question of a new chat — that is the
+   * request that creates the conversation, and it files it into that folder.
+   *
+   * @param {object} handlers - { onMeta, onTool, onWrite, onText, onDone, onError }
    * @param {AbortSignal} [signal] - aborts the request when the user hits stop
    */
-  async streamAssistant({ conversationId, message, replaceFrom }, handlers, signal) {
+  async streamAssistant(
+    { conversationId, message, replaceFrom, projectId, images, keepImageIds, voice },
+    handlers,
+    signal,
+  ) {
     const token = getToken()
     const res = await fetch(`${BASE}/assistant.php`, {
       method: 'POST',
@@ -132,6 +227,16 @@ export const api = {
         conversation_id: conversationId,
         message,
         replace_from: replaceFrom ?? null,
+        project_id: projectId ?? null,
+        // Only the payload the API needs. `previewUrl` is an object URL that
+        // means nothing off this tab, and the rest is for the thumbnail.
+        images: (images ?? []).map(({ media_type, data }) => ({ media_type, data })),
+        // Attachments of the question being rewritten, kept rather than
+        // re-uploaded (see api/lib/images.php).
+        keep_image_ids: keepImageIds ?? [],
+        // Asked out loud. Changes the shape of the answer, not the rules it
+        // answers under — see NOVA_VOICE_HINT in api/assistant.php.
+        voice: Boolean(voice),
       }),
       signal,
     })
@@ -184,6 +289,9 @@ export const api = {
             break
           case 'tool':
             handlers.onTool?.(payload)
+            break
+          case 'write':
+            handlers.onWrite?.(payload.card)
             break
           case 'text':
             handlers.onText?.(payload.delta)

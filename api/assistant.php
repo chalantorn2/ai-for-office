@@ -1,11 +1,12 @@
 <?php
 /**
- * POST /api/assistant.php  { conversation_id?, message, replace_from? }
+ * POST /api/assistant.php  { conversation_id?, message, replace_from?, images?, keep_image_ids? }
  *
  * Runs the tool-calling loop and streams the reply back as Server-Sent Events:
  *
  *   event: meta   { conversation_id, user_message_id }   once, before any text
  *   event: tool   { name }                      each time a tool is called
+ *   event: write  { card }                      a change awaiting confirmation
  *   event: text   { delta }                     assistant text, as it arrives
  *   event: done   { usage, assistant_message_id }        end of turn
  *   event: error  { message }                   fatal; the turn is over
@@ -17,6 +18,13 @@
  * before the new question is stored, which is how editing an earlier question
  * works. Deleting and re-asking in one request means there is no window where
  * a conversation has lost its tail but gained no replacement.
+ *
+ * `images` are base64 payloads the browser has already resized; `keep_image_ids`
+ * carries the attachments of a question being rewritten onto its replacement.
+ * See lib/images.php for what an image costs and why old ones stop replaying.
+ *
+ * `voice` marks a question asked out loud, which needs a different kind of
+ * answer — see NOVA_VOICE_HINT below.
  */
 
 declare(strict_types=1);
@@ -26,6 +34,51 @@ require_once __DIR__ . '/lib/auth.php';
 require_once __DIR__ . '/lib/tools.php';
 require_once __DIR__ . '/lib/anthropic.php';
 require_once __DIR__ . '/lib/usage.php';
+require_once __DIR__ . '/lib/images.php';
+require_once __DIR__ . '/lib/projects.php';
+require_once __DIR__ . '/lib/writes.php';
+
+/**
+ * What changes when the question was spoken rather than typed.
+ *
+ * A reply that reads well is not a reply that listens well. The house style
+ * everywhere else in the prompt — lead with a markdown table, link every record
+ * name back to ContactRate — is exactly wrong out loud: a table has no spoken
+ * form, and a link read aloud is the URL, character by character.
+ *
+ * This rides the *user* turn rather than the system prompt on purpose. The
+ * system prompt and tool schemas are one cached prefix reused by every request
+ * (see lib/anthropic.php); appending to it would rewrite that prefix and turn
+ * every voice turn into a full cache write. Sonnet 5 has no mid-conversation
+ * system role either. Sitting at the end of the last user message costs ~90
+ * tokens and invalidates nothing.
+ *
+ * It is deliberately not stored in `ai_messages`: the transcript should be the
+ * question the person asked, and an edit of that question must not replay it.
+ */
+const NOVA_VOICE_HINT = <<<'HINT'
+
+[โหมดเสียง — คำตอบนี้จะถูกอ่านออกเสียง เขาไม่ได้อ่านจากจอ
+
+**ความสั้นใช้กับคำพูดเท่านั้น ไม่ใช้กับการค้นข้อมูล**
+ค้นให้ครบเหมือนตอนพิมพ์ทุกอย่าง เรียก tool กี่รอบก็ได้ ค้นหลายคำได้
+คำถามมาเป็นภาษาพูดและอาจเพี้ยนจากการถอดเสียง ยิ่งต้องค้นหลายมุมกว่าเดิม
+ห้ามลดจำนวนรอบค้นเพื่อให้ตอบเร็ว
+
+**จำนวนต้องถูกเสมอ** ถ้าเจอ 7 รายการก็บอก 7 ห้ามบอกน้อยกว่าที่เจอเพื่อให้คำตอบสั้น
+เล่ารายละเอียดแค่ 2-3 อันแรกได้ แต่ต้องบอกจำนวนเต็มก่อน แล้วถามว่าอยากฟังอันไหนต่อ
+
+**รูปแบบคำพูด**
+- สั้น เป็นภาษาพูด เหมือนคุยกันต่อหน้า ไม่ต้องเกริ่น
+- ห้ามใช้ตาราง ห้ามใส่ลิงก์ ห้ามใช้ bullet หรือหัวข้อ — ประโยคล้วน
+- ราคาและวันที่เขียนเป็นตัวเลขตามปกติ เช่น "1,200 บาท" ระบบอ่านออกเสียงเองได้
+  ห้ามแปลงเป็นคำอ่าน การแปลงเลขคือที่ที่ราคาเพี้ยน
+
+**ถ้าฟังคำถามไม่ชัด ให้ถามกลับ** ชื่อโรงแรม ชื่อซัพพลายเออร์ และตัวเลข
+ถอดเสียงเพี้ยนบ่อย เดาแล้วตอบผิดแย่กว่าถามใหม่หนึ่งประโยค
+
+กฎเรื่องข้อมูลจริงยังบังคับใช้เต็มทุกข้อ ไม่มีข้อมูลก็คือไม่มี ห้ามเดา]
+HINT;
 
 $user = require_user();
 
@@ -40,12 +93,31 @@ $body = json_body();
 $message = trim((string)($body['message'] ?? ''));
 $conversationId = isset($body['conversation_id']) ? (int)$body['conversation_id'] : 0;
 $replaceFrom = isset($body['replace_from']) ? (int)$body['replace_from'] : 0;
+$keepImageIds = is_array($body['keep_image_ids'] ?? null) ? $body['keep_image_ids'] : [];
+$voice = !empty($body['voice']);
 
-if ($message === '') {
+// Decoded before anything is written, so a bad attachment is a plain 400 rather
+// than a half-stored question. A screenshot on its own is a real question —
+// "อ่านตารางนี้ให้หน่อย" is often typed nowhere but the image itself — so text
+// is only required when nothing is attached.
+try {
+    $images = nova_validate_images(is_array($body['images'] ?? null) ? $body['images'] : []);
+} catch (RuntimeException $e) {
+    json_error(400, 'bad_image', $e->getMessage());
+}
+
+if ($message === '' && !$images && !$keepImageIds) {
     json_error(400, 'empty_message');
 }
 
 $pdo = nova_db();
+
+// Only read when this request creates the conversation. Asking inside a folder
+// files the new chat there; on an existing conversation the folder is already
+// settled and the client does not send one.
+$projectId = $conversationId > 0
+    ? 0
+    : nova_project_id($pdo, $body['project_id'] ?? null, $user['id']);
 
 // Checked before the SSE headers go out, so a refusal is an ordinary 429 the
 // client can show as an error rather than a stream that opens and immediately
@@ -88,6 +160,14 @@ function sse_fatal(string $message): never
 
 // ------------------------------------------------- conversation persistence
 
+/**
+ * Provisional chat title from the question. A question can be nothing but a
+ * screenshot, and a blank row in the sidebar is unclickable in practice.
+ */
+$titleFrom = static fn(string $text): string => $text === ''
+    ? '(รูปภาพ)'
+    : mb_substr($text, 0, 60) . (mb_strlen($text) > 60 ? '…' : '');
+
 try {
     if ($conversationId > 0) {
         $stmt = $pdo->prepare(
@@ -99,9 +179,11 @@ try {
         }
     } else {
         // Provisional title from the first question; good enough, and costs nothing.
-        $title = mb_substr($message, 0, 60) . (mb_strlen($message) > 60 ? '…' : '');
-        $stmt = $pdo->prepare('INSERT INTO ai_conversations (user_id, title) VALUES (?, ?)');
-        $stmt->execute([$user['id'], $title]);
+        $title = $titleFrom($message);
+        $stmt = $pdo->prepare(
+            'INSERT INTO ai_conversations (user_id, project_id, title) VALUES (?, ?, ?)'
+        );
+        $stmt->execute([$user['id'], $projectId ?: null, $title]);
         $conversationId = (int)$pdo->lastInsertId();
     }
 
@@ -133,9 +215,8 @@ try {
         $stmt->execute([$conversationId]);
 
         if ((int)$stmt->fetchColumn() === 0) {
-            $title = mb_substr($message, 0, 60) . (mb_strlen($message) > 60 ? '…' : '');
             $pdo->prepare('UPDATE ai_conversations SET title = ? WHERE id = ?')
-                ->execute([$title, $conversationId]);
+                ->execute([$titleFrom($message), $conversationId]);
         }
     }
 
@@ -144,6 +225,18 @@ try {
     );
     $stmt->execute([$conversationId, 'user', $message]);
     $userMessageId = (int)$pdo->lastInsertId();
+
+    // Fatal if this fails, deliberately. What the model sees is read back off
+    // disk, so an upload that quietly did not land produces an answer about a
+    // screenshot nobody looked at — confidently, and with no sign anything went
+    // wrong. Failing the question is the recoverable outcome.
+    $imageIds = nova_store_images($pdo, $userMessageId, $images);
+    // An edit supersedes the original row and its image rows with it; these
+    // carry the same files onto the rewritten question.
+    $imageIds = [
+        ...$imageIds,
+        ...nova_relink_images($pdo, $conversationId, $userMessageId, $keepImageIds),
+    ];
 } catch (Throwable $e) {
     error_log('nova: persistence failed: ' . $e->getMessage());
     sse_fatal('บันทึกข้อความไม่สำเร็จ');
@@ -151,9 +244,13 @@ try {
 
 // The client needs the real id to offer an edit on this question later; until
 // it arrives the message is held under a local one.
+// `image_ids` lets the client hold on to what it just uploaded: editing this
+// question sends them straight back as `keep_image_ids`, so a corrected typo
+// does not cost the upload — or the tokens — a second time.
 sse('meta', [
     'conversation_id' => $conversationId,
     'user_message_id' => $userMessageId,
+    'image_ids'       => $imageIds,
 ]);
 
 // ------------------------------------------------------------ prompt + loop
@@ -164,7 +261,7 @@ sse('meta', [
  * whose results are no longer in context.
  */
 $stmt = $pdo->prepare(
-    'SELECT role, content FROM ai_messages
+    'SELECT id, role, content FROM ai_messages
       WHERE conversation_id = ? AND superseded_at IS NULL
       ORDER BY id DESC
       LIMIT 21'
@@ -172,9 +269,39 @@ $stmt = $pdo->prepare(
 $stmt->execute([$conversationId]);
 $history = array_reverse($stmt->fetchAll());
 
+// Attachments are the one part of history that is expensive to replay: an image
+// is billed by its pixels every time it is sent, so a screenshot from ten turns
+// back would be paid for ten times over. Only the most recent few still carry
+// their pictures; the rest say in words that a picture was attached.
+$historyImages = nova_load_images($pdo, array_column($history, 'id'));
+$replayable = nova_replayable_ids(array_keys($historyImages));
+
 $messages = [];
 foreach ($history as $row) {
-    $messages[] = ['role' => $row['role'], 'content' => $row['content']];
+    $id = (int)$row['id'];
+    $messages[] = [
+        'role'    => $row['role'],
+        'content' => nova_history_content(
+            (string)$row['content'],
+            $historyImages[$id] ?? [],
+            isset($replayable[$id])
+        ),
+    ];
+}
+
+// Appended to the question just asked, never to the row stored for it. The
+// content of a turn is a plain string until something is attached, so an
+// attachment-free question has to be promoted to blocks first.
+if ($voice && $messages) {
+    $last = array_key_last($messages);
+    $content = $messages[$last]['content'];
+
+    if (is_string($content)) {
+        $content = $content === '' ? [] : [['type' => 'text', 'text' => $content]];
+    }
+    $content[] = ['type' => 'text', 'text' => trim(NOVA_VOICE_HINT)];
+
+    $messages[$last]['content'] = $content;
 }
 
 $today = date('j F Y');
@@ -317,12 +444,47 @@ Other things about the shape of the data:
   should be the things staff care about — name, destination, price, dates.
 - Call several tools in one turn when a question needs it.
 
+## การเพิ่มและแก้ไขข้อมูล
+คุณเพิ่มและแก้ไขได้สองอย่าง — **ทัวร์** กับ **ซัพพลายเออร์** ด้วย tool ที่ขึ้นต้นว่า `propose_`
+แต่ **ตัวคุณเองเขียนข้อมูลไม่ได้** tool พวกนี้แค่เสนอ — จะมีการ์ดขึ้นบนหน้าจอเขา
+พร้อมปุ่มยืนยัน ต้องเขากดเองข้อมูลถึงจะถูกบันทึกลง ContactRate จริง
+
+- **ทำเมื่อเขาสั่งเท่านั้น** ห้ามเสนอแก้เอง เห็นข้อมูลที่ดูผิดหรือขาด ก็บอกเฉยๆ
+  แล้วให้เขาตัดสินใจ ไม่ใช่เรียก tool ดักไว้ก่อน
+- **ค้นก่อนเสมอ** update ต้องแน่ใจว่าแก้ถูกรายการ ถ้าชื่อใกล้เคียงกันหลายอัน ถามก่อนว่าอันไหน
+  create ต้องค้นก่อนว่ายังไม่มีอยู่แล้ว จะได้ไม่เพิ่มซ้ำ — ซัพพลายเออร์ที่ถูกเพิ่มซ้ำ
+  จะทำให้ทัวร์ของเจ้าเดียวกันแตกไปอยู่คนละราย และไม่มีอะไรในระบบเตือนทีหลัง
+- **ห้ามเติมค่าที่เขาไม่ได้บอก** ส่งเฉพาะสิ่งที่เขาพูดจริงๆ ขาดอะไรที่จำเป็นก็ถาม
+  ราคาและวันที่คือของที่เดาไม่ได้เด็ดขาด
+- update ส่งเฉพาะฟิลด์ที่จะเปลี่ยน ฟิลด์ที่ไม่ได้ส่งจะคงเดิม
+- `notes` เป็นการเขียนทับทั้งก้อน ถ้าจะเพิ่มบรรทัดเดียว ต้องอ่านของเดิมด้วย
+  `get_tour_details` แล้วส่งข้อความเต็มชุดใหม่ ไม่งั้นหมายเหตุเดิมหายทั้งหมด
+- ถ้าเลขที่เขาบอกดูผิดปกติ (ราคาหลักแสน วันที่ย้อนหลังไปหลายปี) ทักก่อน อย่าเพิ่งเสนอ
+- หลังเรียก tool แล้ว บอกสั้นๆ ว่ากำลังจะเปลี่ยนอะไร แล้วให้เขากดยืนยัน
+  ไม่ต้องไล่รายการซ้ำ การ์ดบอกครบแล้ว
+- **ห้ามพูดว่าแก้แล้ว บันทึกแล้ว หรือเพิ่มให้แล้ว** ตอนนั้นยังไม่มีอะไรเกิดขึ้น
+  และคุณจะไม่รู้ด้วยว่าสุดท้ายเขากดยืนยันหรือกดยกเลิก ถ้าเขาถามทีหลังว่าเข้าไปหรือยัง ให้ค้นดูใหม่
+- ทัวร์ต้องมีซัพพลายเออร์ ทัวร์ 280 รายการในระบบ มีแค่รายการเดียวที่ไม่มี
+  ถ้าจะเพิ่มทัวร์แต่ซัพพลายเออร์ยังไม่มีในระบบ ให้เสนอเพิ่มซัพพลายเออร์ก่อน
+  รอเขายืนยัน แล้วค่อยเสนอทัวร์ — อย่าเพิ่มทัวร์ทิ้งไว้โดยไม่ผูกซัพพลายเออร์
+- เบอร์โทรใหม่ของซัพพลายเออร์ ปกติควรลงช่องที่ยังว่าง (เบอร์โทร 2-5) ไม่ใช่ทับเบอร์เดิม
+  ถ้าไม่ชัดว่าเขาหมายถึงอันไหน ถามก่อน
+- **ลบไม่ได้** ถ้าเขาสั่งลบ บอกว่าคุณลบไม่ได้ ต้องไปลบใน ContactRate เอง
+- โรงแรมกับราคาห้องพักแก้ไม่ได้ คุณแก้ได้แค่ทัวร์กับซัพพลายเออร์
+
 ## Links back to ContactRate
-Tool results carry a `link` for each tour, hotel, and supplier. Staff read a
-price here and then go there to act on it, so make the record's name a markdown
-link to it — `[Patong Beach Hotel](…)` — every time you name one. In a table,
-link the name in the name column. Never print a bare URL, and never build a link
-yourself: use the one the tool gave you, or none at all.
+Tool results carry a `link` for each tour, hotel, and supplier — the record's
+own page, where staff go to read the rest of it. Make the record's name a
+markdown link to it — `[Patong Beach Hotel](…)` — every time you name one. In a
+table, link the name in the name column. Never print a bare URL, and never build
+a link yourself: use the one the tool gave you, or none at all.
+
+`get_tour_details` also returns an `edit_link`, which opens the tour's edit form.
+That one is not for browsing. Give it only when the person has said they want to
+change the tour and is going to do it themselves in ContactRate — asked for it,
+or asked to edit something you cannot (delete a tour, a field you do not handle).
+Never attach it to a tour you are merely reporting on, and never use it as the
+name link.
 
 ## Who you are talking to
 Staff, not engineers. They know tours and hotels; they do not know how the data
@@ -341,9 +503,10 @@ is stored, and they should not have to.
 คุณเป็นพนักงานที่ตอบเรื่องข้อมูล ไม่ใช่คนดูแลระบบ
 
 - ไม่อธิบายว่าระบบทำงานยังไง ไม่พูดถึงฐานข้อมูล เครื่องมือ โค้ด หรือ AI
-- ไม่เสนอให้แก้ระบบ เพิ่มฟิลด์ หรือปรับข้อมูล และไม่พูดว่า "เดี๋ยวผมจัดการให้" —
-  คุณแก้อะไรไม่ได้ คุณอ่านได้อย่างเดียว
-- ข้อมูลขาดหรือผิด บอกว่าขาดอะไร แล้วให้เขาไปแก้ใน ContactRate เอง
+- ไม่เสนอให้แก้ระบบหรือเพิ่มฟิลด์ และไม่พูดว่า "เดี๋ยวผมจัดการให้" — สิ่งเดียวที่คุณทำได้
+  คือเสนอเพิ่มหรือแก้ทัวร์ตามที่เขาสั่ง แล้วรอเขากดยืนยัน
+- ข้อมูลขาดหรือผิด บอกว่าขาดอะไร ถ้าเป็นทัวร์และเขาสั่งให้แก้ ค่อยเสนอแก้
+  อย่างอื่นให้เขาไปแก้ใน ContactRate เอง
 - ถูกถามเรื่องนอกหน้าที่ (ตั้งราคาขาย ตัดสินใจแทน เรื่องคอมพัง) บอกสั้นๆ ว่าไม่ใช่
   งานคุณ แล้วเสนอสิ่งที่คุณช่วยได้แทน
 PROMPT;
@@ -360,6 +523,10 @@ $cacheWrite = 0;
 // Billed per search on top of tokens, so worth counting on its own.
 $searches = 0;
 $sources = [];
+// ai_record_writes ids proposed during this turn, tied to the reply once it has an
+// id of its own — that link is what puts the confirm card back under the right
+// message when the chat is reopened.
+$pendingWrites = [];
 
 try {
     for ($round = 0; $round < NOVA_MAX_ROUNDS; $round++) {
@@ -414,7 +581,22 @@ try {
 
             sse('tool', ['name' => $block['name']]);
             // `input` is an empty stdClass when the tool took no arguments.
-            $output = nova_run_tool($pdo, $block['name'], (array)($block['input'] ?? []));
+            $output = nova_run_tool($pdo, $block['name'], (array)($block['input'] ?? []), [
+                'user_id'         => $user['id'],
+                'username'        => $user['username'],
+                'conversation_id' => $conversationId,
+            ]);
+
+            // A proposed change to ContactRate. The card goes to the browser and
+            // is stripped before the result goes back to the model: it is the
+            // same information in a shape meant for rendering, and paying input
+            // tokens to send it twice would only give the model a second, more
+            // detailed version to read out loud.
+            if (isset($output['_card'])) {
+                $pendingWrites[] = (int)$output['_card']['id'];
+                sse('write', ['card' => $output['_card']]);
+                unset($output['_card']);
+            }
 
             $toolResults[] = [
                 'type'        => 'tool_result',
@@ -475,6 +657,7 @@ try {
         $totalIn, $totalOut, $cacheRead, $cacheWrite, $searches, NOVA_MODEL,
     ]);
     $assistantMessageId = (int)$pdo->lastInsertId();
+    nova_link_writes($pdo, $pendingWrites, $assistantMessageId);
 
     // Touch the conversation so it sorts to the top of the sidebar.
     $pdo->prepare('UPDATE ai_conversations SET updated_at = NOW() WHERE id = ?')

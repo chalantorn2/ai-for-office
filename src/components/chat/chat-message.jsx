@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { AnimatePresence, motion } from 'motion/react'
@@ -9,9 +10,12 @@ import {
   Loader2,
   Pencil,
   TriangleAlert,
+  X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { NovaMark } from '@/components/nova-mark'
+import { WriteConfirm } from '@/components/chat/write-confirm'
+import { loadImage } from '@/lib/api'
 import { downloadCsv, readTable, toTsv } from '@/lib/table-export'
 import { cn } from '@/lib/utils'
 
@@ -40,6 +44,13 @@ const TOOL_LABELS = {
   get_hotel_rates: 'กำลังดูราคาห้องพัก',
   get_hotel_details: 'กำลังดูรายละเอียดโรงแรม',
   search_suppliers: 'กำลังค้นหาซัพพลายเออร์',
+  get_supplier_files: 'กำลังดูไฟล์ซัพพลายเออร์',
+  // Worded as preparing, not saving. These two write nothing on their own — the
+  // card they produce is what writes, and only once somebody presses the button.
+  propose_tour_create: 'กำลังเตรียมข้อมูลทัวร์ใหม่',
+  propose_tour_update: 'กำลังเตรียมข้อมูลทัวร์ที่จะแก้',
+  propose_supplier_create: 'กำลังเตรียมข้อมูลซัพพลายเออร์ใหม่',
+  propose_supplier_update: 'กำลังเตรียมข้อมูลซัพพลายเออร์ที่จะแก้',
   // Server-side: the stream stalls while Anthropic searches, so this label is
   // the only thing on screen for a few seconds. It has to be accurate —
   // "searching the web" and "adding up our own prices" are very different
@@ -64,11 +75,14 @@ export const ChatMessage = memo(function ChatMessage({
   id,
   role,
   content,
+  images,
   tool,
+  writes,
   pending,
   editable,
   trailing,
   onEdit,
+  onDecideWrite,
 }) {
   const [editing, setEditing] = useState(false)
 
@@ -77,6 +91,7 @@ export const ChatMessage = memo(function ChatMessage({
       return (
         <QuestionEditor
           content={content}
+          images={images}
           trailing={trailing}
           onCancel={() => setEditing(false)}
           onSubmit={(text) => {
@@ -102,8 +117,15 @@ export const ChatMessage = memo(function ChatMessage({
             <Pencil className="size-3.5" />
           </button>
         )}
-        <div className="max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-4 py-2.5 text-[15px] leading-7 break-words whitespace-pre-wrap">
-          {content}
+        <div className="flex max-w-[85%] flex-col items-end gap-1.5">
+          {images?.length > 0 && <Attachments images={images} />}
+          {/* A screenshot on its own is a whole question; an empty bubble under
+              it would just be a grey smudge. */}
+          {content !== '' && (
+            <div className="rounded-2xl rounded-br-md bg-secondary px-4 py-2.5 text-[15px] leading-7 break-words whitespace-pre-wrap">
+              {content}
+            </div>
+          )}
         </div>
       </motion.div>
     )
@@ -144,11 +166,174 @@ export const ChatMessage = memo(function ChatMessage({
           </div>
         )}
 
+        {/* Below the reply rather than above it: the sentence explains what the
+            card is about, and a confirm button that appears before its
+            explanation invites a click before the reading. */}
+        {writes?.map((card) => (
+          <WriteConfirm key={card.id} card={card} onDecide={onDecideWrite} />
+        ))}
+
         {content && !pending && <CopyButton text={content} />}
       </div>
     </motion.div>
   )
 })
+
+/**
+ * Pictures attached to a question, above its text.
+ *
+ * Capped at a readable size rather than shown full width: the point on screen
+ * is recognising which screenshot this was, and the point of clicking one is
+ * reading it — small text in a rate table is not legible in a thread at any
+ * size that leaves room for the conversation.
+ */
+function Attachments({ images }) {
+  return (
+    <div className="flex flex-wrap justify-end gap-1.5">
+      {images.map((image) => (
+        <AttachedImage key={image.id} image={image} />
+      ))}
+    </div>
+  )
+}
+
+function AttachedImage({ image }) {
+  // A locally attached image already has its bytes in the tab and needs no
+  // fetch; one loaded from history does, because uploads are not served
+  // directly and <img> cannot send an Authorization header.
+  const [fetched, setFetched] = useState(null)
+  const [failed, setFailed] = useState(false)
+  const [zoomed, setZoomed] = useState(false)
+  const url = image.previewUrl ?? fetched
+
+  useEffect(() => {
+    if (image.previewUrl) return
+
+    let live = true
+    loadImage(image.id).then(
+      (blobUrl) => live && setFetched(blobUrl),
+      () => live && setFailed(true),
+    )
+    return () => {
+      live = false
+    }
+  }, [image.id, image.previewUrl])
+
+  // Known up front from the stored dimensions, so the thread does not shift
+  // under the reader as each picture lands.
+  const ratio = image.width && image.height ? image.width / image.height : 4 / 3
+
+  if (failed) {
+    return (
+      <div className="flex h-24 w-32 items-center justify-center rounded-xl border border-dashed text-xs text-muted-foreground">
+        โหลดรูปไม่สำเร็จ
+      </div>
+    )
+  }
+
+  return (
+    <>
+      <button
+        // Nothing to open until the bytes are here; the placeholder stays inert.
+        onClick={() => url && setZoomed(true)}
+        disabled={!url}
+        title="ดูรูปเต็ม"
+        className={cn(
+          'block max-h-64 overflow-hidden rounded-xl border bg-muted',
+          url && 'cursor-zoom-in transition-opacity hover:opacity-90',
+        )}
+        style={{ aspectRatio: ratio, maxWidth: '16rem' }}
+      >
+        {url ? (
+          <img
+            src={url}
+            alt={image.name ?? 'รูปที่แนบ'}
+            className="size-full object-cover"
+          />
+        ) : (
+          <div className="size-full animate-pulse bg-muted-foreground/15" />
+        )}
+      </button>
+
+      <AnimatePresence>
+        {zoomed && (
+          <Lightbox
+            url={url}
+            name={image.name}
+            onClose={() => setZoomed(false)}
+          />
+        )}
+      </AnimatePresence>
+    </>
+  )
+}
+
+/**
+ * The attached picture at full size, over the conversation.
+ *
+ * Opening a tab was the first version of this and was wrong for what people
+ * actually do with it: reading a rate off a screenshot is a glance in the
+ * middle of a question, and coming back from a tab means finding the chat
+ * again and losing your place in it. Escape or a click anywhere outside puts
+ * it away.
+ *
+ * Rendered through a portal because every message is inside an animated
+ * element, and a transformed ancestor makes `position: fixed` resolve against
+ * that ancestor instead of the viewport — which would trap this inside the
+ * bubble it came from.
+ */
+function Lightbox({ url, name, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose()
+    document.addEventListener('keydown', onKey)
+
+    // The page behind must not scroll under the overlay — on a trackpad it is
+    // otherwise very easy to lose the thread's position while zoomed in.
+    const { overflow } = document.body.style
+    document.body.style.overflow = 'hidden'
+
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = overflow
+    }
+  }, [onClose])
+
+  return createPortal(
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={name ?? 'รูปที่แนบ'}
+      className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+    >
+      <motion.img
+        initial={{ scale: 0.96 }}
+        animate={{ scale: 1 }}
+        exit={{ scale: 0.96 }}
+        transition={{ duration: 0.15 }}
+        src={url}
+        alt={name ?? 'รูปที่แนบ'}
+        // Clicking the picture itself should not close it — only the space
+        // around it, which is what the cursor over that space says it does.
+        onClick={(e) => e.stopPropagation()}
+        className="max-h-full max-w-full cursor-default rounded-lg object-contain shadow-2xl"
+      />
+
+      <button
+        onClick={onClose}
+        aria-label="ปิด"
+        className="absolute top-4 right-4 flex size-9 items-center justify-center rounded-full bg-background/90 text-foreground shadow-lg transition-colors hover:bg-background"
+      >
+        <X className="size-4" />
+      </button>
+    </motion.div>,
+    document.body,
+  )
+}
 
 const MAX_EDIT_HEIGHT = 200
 
@@ -161,7 +346,7 @@ const MAX_EDIT_HEIGHT = 200
  * dismiss it. Here the count is on screen while the question is being typed,
  * which is when it can still change the decision.
  */
-function QuestionEditor({ content, trailing, onCancel, onSubmit }) {
+function QuestionEditor({ content, images, trailing, onCancel, onSubmit }) {
   const ref = useRef(null)
   const [value, setValue] = useState(content)
 
@@ -183,7 +368,8 @@ function QuestionEditor({ content, trailing, onCancel, onSubmit }) {
     el.setSelectionRange(el.value.length, el.value.length)
   }, [])
 
-  const canSend = value.trim().length > 0
+  // Same rule as the composer: with a picture attached, the text is optional.
+  const canSend = value.trim().length > 0 || images?.length > 0
 
   function handleKeyDown(e) {
     if (e.key === 'Escape') {
@@ -205,6 +391,15 @@ function QuestionEditor({ content, trailing, onCancel, onSubmit }) {
           'transition-colors focus-within:border-ring/60',
         )}
       >
+        {/* Shown, not editable. The pictures come along with the rewritten
+            question rather than being dropped with the row it replaces, and
+            seeing them is what makes that obvious. */}
+        {images?.length > 0 && (
+          <div className="mb-1 px-2 pt-1">
+            <Attachments images={images} />
+          </div>
+        )}
+
         <textarea
           ref={ref}
           rows={1}

@@ -12,6 +12,11 @@
         EXCEPT api/config.local.php, which holds the database password, JWT signing
         key, and Anthropic API key. That file is created once on the server by
         scripts/make-server-config.ps1 and is never overwritten by a deploy.
+    * api/uploads/                                                     -> .htaccess only
+        The directory belongs to the deployment, not the source: it holds images
+        staff attached to a question. Only the .htaccess that closes it to the web
+        is uploaded; the local development images are never pushed, and the
+        server's are never touched.
 
   Credentials come from the main repo's gitignored deploy.secret.ps1.
 
@@ -46,6 +51,11 @@ $Docroot = '/ai.sevensmiletourandticket.com'
 # overwrite the server's copy with a developer's local one — the local file points
 # at the database over the public internet, the server's points at localhost.
 $NeverUpload = @('config.local.php')
+
+# api/uploads/ is deployment state, not source. Its contents are gitignored and a
+# developer's copy has nothing to do with the server's, so the tree walk skips it
+# entirely and the .htaccess inside is sent on its own, below.
+$UploadsSkip = @('uploads')
 
 # ---------------------------------------------------------------- FTP plumbing
 
@@ -173,7 +183,16 @@ if (-not $ApiOnly) {
 $apiDir = Join-Path $root 'api'
 if (Test-Path $apiDir) {
   Write-Host "==> Uploading api/" -ForegroundColor Cyan
-  Send-FtpTree $apiDir "$Docroot/api" -DryRun:$DryRun -Exclude $NeverUpload
+  Send-FtpTree $apiDir "$Docroot/api" -DryRun:$DryRun -Exclude ($NeverUpload + $UploadsSkip)
+
+  # The upload directory itself must exist before the first image is attached,
+  # and must stay closed to the web. Nothing else in it is ours to send.
+  $uploadsHtaccess = Join-Path $apiDir 'uploads\.htaccess'
+  if (Test-Path $uploadsHtaccess) {
+    Write-Host "==> api/uploads/ (.htaccess only)" -ForegroundColor Cyan
+    New-FtpDir "$Docroot/api/uploads" -DryRun:$DryRun
+    Send-FtpFile $uploadsHtaccess "$Docroot/api/uploads/.htaccess" -DryRun:$DryRun
+  }
 } else {
   Write-Host "==> no api/ directory - skipping backend" -ForegroundColor Yellow
 }

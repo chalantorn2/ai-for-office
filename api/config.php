@@ -94,6 +94,19 @@ function json_error(int $status, string $code, string $message = ''): never
 function json_body(): array
 {
     $raw = file_get_contents('php://input') ?: '';
+
+    // PHP discards the body of a request over post_max_size and carries on, so
+    // the endpoint sees an empty payload rather than an error — a question with
+    // screenshots attached would come back as "you didn't type anything". The
+    // announced length is still in the headers, which is what gives it away.
+    if ($raw === '' && (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
+        json_error(
+            413,
+            'request_too_large',
+            'รูปที่แนบรวมกันใหญ่เกินกว่าที่เซิร์ฟเวอร์รับได้ — ลองแนบทีละรูป'
+        );
+    }
+
     $data = json_decode($raw, true);
     return is_array($data) ? $data : [];
 }
